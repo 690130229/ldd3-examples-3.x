@@ -74,13 +74,14 @@ module_param(pool_size, int, 0);
 /*
  * This structure is private to each device. It is used to pass
  * packets in and out, so there is place for a packet
+ *
  */
 
 struct snull_priv {
 	struct net_device *dev;
 	struct napi_struct napi;
-	struct net_device_stats stats;
-	int status;
+	struct net_device_stats stats; /*some summary information?*/
+	int status; //IN or OUT ?
 	struct snull_packet *ppool;
 	struct snull_packet *rx_queue;  /* List of incoming packets */
 	int rx_int_enabled;
@@ -259,15 +260,18 @@ void snull_rx(struct net_device *dev, struct snull_packet *pkt)
 	/*
 	 * The packet has been retrieved from the transmission
 	 * medium. Build an skb around it, so upper layers can handle it
+	 * The first is to allocate a buffer to hold the packet.
 	 */
-	skb = dev_alloc_skb(pkt->datalen + 2);
+	skb = dev_alloc_skb(pkt->datalen + 2); // calls the kmalloc with atomic priority.
 	if (!skb) {
-		if (printk_ratelimit())
+		if (printk_ratelimit())//printk_ratelimit默认允许在5s内最多打印10条消息出来
 			printk(KERN_NOTICE "snull rx: low on mem - packet dropped\n");
 		priv->stats.rx_dropped++;
 		goto out;
 	}
-	skb_reserve(skb, 2); /* align IP on 16B boundary */  
+	skb_reserve(skb, 2); /* align IP on 16B boundary */
+	//skb_put function updates the end-of-data pointer in the buffer and returns a pointer to the newly
+	//created space.
 	memcpy(skb_put(skb, pkt->datalen), pkt->data, pkt->datalen);
 
 	/* Write metadata, and then pass to the receive level */
@@ -276,7 +280,8 @@ void snull_rx(struct net_device *dev, struct snull_packet *pkt)
 	skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
 	priv->stats.rx_packets++;
 	priv->stats.rx_bytes += pkt->datalen;
-	netif_rx(skb);
+	//hands off the socket buffer to upper layers.
+	netif_rx(skb);//maybe in newer kernel there may be the newer api.
   out:
 	return;
 }
@@ -284,6 +289,9 @@ void snull_rx(struct net_device *dev, struct snull_packet *pkt)
 
 /*
  * The poll implementation.
+ * The central part of the function is concerned with the creation of an skb holding the packet.
+ * this code is the same as what we saw in snull_rx before, but a nujmber of things are different, however:
+ * budget: Provides a maximum number of packets that we are allowed to pass into the kernel.
  */
 static int snull_poll(struct napi_struct *napi, int budget)
 {
@@ -310,7 +318,7 @@ static int snull_poll(struct napi_struct *napi, int budget)
 		skb->dev = dev;
 		skb->protocol = eth_type_trans(skb, dev);
 		skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
-		netif_receive_skb(skb);
+		netif_receive_skb(skb); //fed to the kernel, rather that netif_rx (for napi)
 		
         	/* Maintain stats */
 		npackets++;
@@ -319,6 +327,9 @@ static int snull_poll(struct napi_struct *napi, int budget)
 		snull_release_buffer(pkt);
 	}
 	/* If we processed all packets, we're done; tell the kernel and reenable ints */
+	//LL: If the poll method is able to process all of the available packets within the limits given to it.
+	//It should re-enable receive interrupts, call netif_rx_complete to turn off polling ,and return 0,
+	//A return value of 1 indicates that there are packets remaining to be processed.
 	if (! priv->rx_queue) {
 		napi_complete(napi);
 		snull_rx_ints(dev, 1);
@@ -355,7 +366,7 @@ static void snull_regular_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 	/* retrieve statusword: real netdevices use I/O instructions */
 	statusword = priv->status;
 	priv->status = 0;
-	if (statusword & SNULL_RX_INTR) {
+	if (statusword & SNULL_RX_INTR) { //LL: Receive a new packet
 		/* send it to snull_rx for handling */
 		pkt = priv->rx_queue;
 		if (pkt) {
@@ -363,11 +374,11 @@ static void snull_regular_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 			snull_rx(dev, pkt);
 		}
 	}
-	if (statusword & SNULL_TX_INTR) {
+	if (statusword & SNULL_TX_INTR) { //LL: Transfer over (done)
 		/* a transmission is over: free the skb */
 		priv->stats.tx_packets++;
 		priv->stats.tx_bytes += priv->tx_packetlen;
-		dev_kfree_skb(priv->skb);
+		dev_kfree_skb(priv->skb);//LL: Release socket buffer to system.
 	}
 
 	/* Unlock the device and we are done */
@@ -402,9 +413,12 @@ static void snull_napi_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 	/* retrieve statusword: real netdevices use I/O instructions */
 	statusword = priv->status;
 	priv->status = 0;
+	//LL: when your interface signals that a packet has arrived, the interrupt handler should not process that packet
+	//, instead, it should disable further interrupts and tell the kernel that it is time to start polling the interface.
+	//
 	if (statusword & SNULL_RX_INTR) {
 		snull_rx_ints(dev, 0);  /* Disable further interrupts */
-		napi_schedule(&priv->napi);
+		napi_schedule(&priv->napi);//LL: which causes our poll method to be called at some point.
 	}
 	if (statusword & SNULL_TX_INTR) {
         	/* a transmission is over: free the skb */
@@ -615,7 +629,7 @@ static const struct net_device_ops snull_netdev_ops = {
 	.ndo_start_xmit		= snull_tx,
 	.ndo_do_ioctl		= snull_ioctl,
 	.ndo_get_stats		= snull_stats,
-	.ndo_change_mtu		= snull_change_mtu,
+//	.ndo_change_mtu		= snull_change_mtu,
 	.ndo_tx_timeout         = snull_tx_timeout,
 };
 
@@ -688,9 +702,9 @@ void snull_cleanup(void)
     
 	for (i = 0; i < 2;  i++) {
 		if (snull_devs[i]) {
-			unregister_netdev(snull_devs[i]);
+			unregister_netdev(snull_devs[i]);/*remove interface from system*/
 			snull_teardown_pool(snull_devs[i]);
-			free_netdev(snull_devs[i]);
+			free_netdev(snull_devs[i]);/*give the net_device to kernel, we can not do anything to this device or the private data*/
 		}
 	}
 	return;
@@ -705,11 +719,15 @@ int snull_init_module(void)
 
 	snull_interrupt = use_napi ? snull_napi_interrupt : snull_regular_interrupt;
 
-	/* Allocate the devices */
-	snull_devs[0] = alloc_netdev(sizeof(struct snull_priv), "sn%d", NET_NAME_UNKNOWN,
-			snull_init);
-	snull_devs[1] = alloc_netdev(sizeof(struct snull_priv), "sn%d", NET_NAME_UNKNOWN,
-			snull_init);
+//	/* Allocate the devices */
+//	snull_devs[0] = alloc_netdev(sizeof(struct snull_priv), "sn%d", NET_NAME_UNKNOWN,
+//			snull_init);
+//	snull_devs[1] = alloc_netdev(sizeof(struct snull_priv), "sn%d", NET_NAME_UNKNOWN,
+//			snull_init);
+	snull_devs[0] = alloc_netdev(sizeof(struct snull_priv), "sn%d",
+								 snull_init);
+	snull_devs[1] = alloc_netdev(sizeof(struct snull_priv), "sn%d",
+								 snull_init);
 	if (snull_devs[0] == NULL || snull_devs[1] == NULL)
 		goto out;
 
