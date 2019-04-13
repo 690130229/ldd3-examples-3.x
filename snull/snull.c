@@ -65,7 +65,7 @@ struct snull_packet {
 	struct snull_packet *next;
 	struct net_device *dev;
 	int	datalen;
-	u8 data[ETH_DATA_LEN];
+	u8 data[ETH_DATA_LEN];// 1500 max MTU
 };
 
 int pool_size = 8;
@@ -82,20 +82,22 @@ struct snull_priv {
 	struct napi_struct napi;
 	struct net_device_stats stats; /*some summary information?*/
 	int status; //IN or OUT ?
-	struct snull_packet *ppool;
-	struct snull_packet *rx_queue;  /* List of incoming packets */
-	int rx_int_enabled;
-	int tx_packetlen;
-	u8 *tx_packetdata;
+	struct snull_packet *ppool;//LL This is a list
+	struct snull_packet *rx_queue;  /* List of incoming packets, actually it's a list */
+	int rx_int_enabled; //LL: Interrupt enabled?
+	int tx_packetlen; //LL Transmition packet lenght?
+	u8 *tx_packetdata;//LL Transmition packet data?
+	//LL the sk_buffer that upper layer can recongnize? no used to store hte packet being transimtion.
 	struct sk_buff *skb;
-	spinlock_t lock;
+	spinlock_t lock;//LL each device has this priv data, so need to protect it before using?
 };
 
-static void snull_tx_timeout(struct net_device *dev);
-static void (*snull_interrupt)(int, void *, struct pt_regs *);
+static void snull_tx_timeout(struct net_device *dev);//Transimation timeout event occur?
+static void (*snull_interrupt)(int, void *, struct pt_regs *);//Interrupt occur, received packet or the transmition packet done?
 
 /*
  * Set up a device's packet pool.
+ * What's for? a list used to store the packet (raw data?)
  */
 void snull_setup_pool(struct net_device *dev)
 {
@@ -104,7 +106,7 @@ void snull_setup_pool(struct net_device *dev)
 	struct snull_packet *pkt;
 
 	priv->ppool = NULL;
-	for (i = 0; i < pool_size; i++) {
+	for (i = 0; i < pool_size; i++) {//LL: default pool_size is 8.
 		pkt = kmalloc (sizeof (struct snull_packet), GFP_KERNEL);
 		if (pkt == NULL) {
 			printk (KERN_NOTICE "Ran out of memory allocating packet pool\n");
@@ -121,7 +123,7 @@ void snull_teardown_pool(struct net_device *dev)
 	struct snull_priv *priv = netdev_priv(dev);
 	struct snull_packet *pkt;
     
-	while ((pkt = priv->ppool)) {
+	while ((pkt = priv->ppool)) {//LL: free those space.
 		priv->ppool = pkt->next;
 		kfree (pkt);
 		/* FIXME - in-flight packets ? */
@@ -142,7 +144,8 @@ struct snull_packet *snull_get_tx_buffer(struct net_device *dev)
 	priv->ppool = pkt->next;
 	if (priv->ppool == NULL) {
 		printk (KERN_INFO "Pool empty\n");
-		netif_stop_queue(dev);
+		//To tell the kernel network subsystem to there is no room for network card to receive the packet so stop to send it to me.
+		netif_stop_queue(dev);//Pause to receive data from kernel.
 	}
 	spin_unlock_irqrestore(&priv->lock, flags);
 	return pkt;
@@ -172,7 +175,7 @@ void snull_enqueue_buf(struct net_device *dev, struct snull_packet *pkt)
 	priv->rx_queue = pkt;
 	spin_unlock_irqrestore(&priv->lock, flags);
 }
-
+//LL: After dequeue, it buffer should be release to the ppool queue.
 struct snull_packet *snull_dequeue_buf(struct net_device *dev)
 {
 	struct snull_priv *priv = netdev_priv(dev);
@@ -199,6 +202,7 @@ static void snull_rx_ints(struct net_device *dev, int enable)
     
 /*
  * Open and close
+ * When to use open, ifup sn0 ? or sn1 ? have the mac address you can receive the packets?
  */
 
 int snull_open(struct net_device *dev)
@@ -213,7 +217,7 @@ int snull_open(struct net_device *dev)
 	memcpy(dev->dev_addr, "\0SNUL0", ETH_ALEN);
 	if (dev == snull_devs[1])
 		dev->dev_addr[ETH_ALEN-1]++; /* \0SNUL1 */
-	netif_start_queue(dev);
+	netif_start_queue(dev);//LL: tell the kernel we can receive packets now.
 	return 0;
 }
 
@@ -251,6 +255,9 @@ int snull_config(struct net_device *dev, struct ifmap *map)
 
 /*
  * Receive a packet: retrieve, encapsulate and pass over to upper levels
+ * LL: This is called by interrupt due to when network card received the packet
+ * the driver being notified by cpu interrupt.
+ * pkt: This is just the raw data we should build it up to sk_buff.
  */
 void snull_rx(struct net_device *dev, struct snull_packet *pkt)
 {
@@ -276,12 +283,17 @@ void snull_rx(struct net_device *dev, struct snull_packet *pkt)
 
 	/* Write metadata, and then pass to the receive level */
 	skb->dev = dev;
+	//LL: establish the packet type eg ETH_P_IP and remove the MAC header and then either;
 	skb->protocol = eth_type_trans(skb, dev);
 	skb->ip_summed = CHECKSUM_UNNECESSARY; /* don't check it */
 	priv->stats.rx_packets++;
 	priv->stats.rx_bytes += pkt->datalen;
 	//hands off the socket buffer to upper layers.
-	netif_rx(skb);//maybe in newer kernel there may be the newer api.
+	//This function receives a packet from a device driver and queues it for the upper (protocol) levels
+	// to process, It always succeeds, The buffer may be dropped processing for congestion control or
+	// by the protocol layers. and the ksoftirqd will be called here it hard to say the network driver work on
+	// which layer of TCP/IP, the netif_rx will put the sk_buff to the kernel receiving queue.
+	netif_rx(skb);//maybe in newer kernel there may be the newer api. post buffer to the network code.
   out:
 	return;
 }
@@ -436,6 +448,7 @@ static void snull_napi_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 
 /*
  * Transmit a packet (low level interface)
+ * LL: buf is the raw data being transferred.
  */
 static void snull_hw_tx(char *buf, int len, struct net_device *dev)
 {
@@ -452,6 +465,7 @@ static void snull_hw_tx(char *buf, int len, struct net_device *dev)
 	struct snull_packet *tx_buffer;
     
 	/* I am paranoid. Ain't I? */
+	//LL: less than the eth header + ip header.
 	if (len < sizeof(struct ethhdr) + sizeof(struct iphdr)) {
 		printk("snull: Hmm... packet too short (%i octets)\n",
 				len);
@@ -492,16 +506,18 @@ static void snull_hw_tx(char *buf, int len, struct net_device *dev)
 	 * Ok, now the packet is ready for transmission: first simulate a
 	 * receive interrupt on the twin device, then  a
 	 * transmission-done on the transmitting device
+	 * The data is not actually being transmitted, it just got by another interface. pls
+	 * check the snull_interrupt for moure details.
 	 */
 	dest = snull_devs[dev == snull_devs[0] ? 1 : 0];
 	priv = netdev_priv(dest);
-	tx_buffer = snull_get_tx_buffer(dev);
+	tx_buffer = snull_get_tx_buffer(dev);//LL: get the space from the pool and enqueue.
 	tx_buffer->datalen = len;
 	memcpy(tx_buffer->data, buf, len);
-	snull_enqueue_buf(dest, tx_buffer);
+	snull_enqueue_buf(dest, tx_buffer);//LL: enqueue the packet.
 	if (priv->rx_int_enabled) {
 		priv->status |= SNULL_RX_INTR;
-		snull_interrupt(0, dest, NULL);
+		snull_interrupt(0, dest, NULL);//LL: Actually it not transmitted yet.
 	}
 
 	priv = netdev_priv(dev);
@@ -520,6 +536,7 @@ static void snull_hw_tx(char *buf, int len, struct net_device *dev)
 
 /*
  * Transmit a packet (called by the kernel)
+ * LL: dev_queue_xmit -> hard_start_xmit (2.4??)
  */
 int snull_tx(struct sk_buff *skb, struct net_device *dev)
 {
@@ -527,7 +544,7 @@ int snull_tx(struct sk_buff *skb, struct net_device *dev)
 	char *data, shortpkt[ETH_ZLEN];
 	struct snull_priv *priv = netdev_priv(dev);
 	
-	data = skb->data;
+	data = skb->data; //LL: Including the eth header + IP header + TCP/UDP header + data.
 	len = skb->len;
 	if (len < ETH_ZLEN) {
 		memset(shortpkt, 0, ETH_ZLEN);
@@ -540,6 +557,7 @@ int snull_tx(struct sk_buff *skb, struct net_device *dev)
 	priv->skb = skb;
 
 	/* actual deliver of data is device-specific, and not shown here */
+	//LL: When transimtion is done the interrupt will be triggered and the buffer will be freed.
 	snull_hw_tx(data, len, dev);
 
 	return 0; /* Our simple device can not fail */
@@ -747,3 +765,23 @@ int snull_init_module(void)
 
 module_init(snull_init_module);
 module_exit(snull_cleanup);
+
+/***
+ *
+sn0: flags=4291<UP,BROADCAST,RUNNING,NOARP,MULTICAST>  mtu 1500
+        inet 192.168.0.1  netmask 255.255.255.0  broadcast 192.168.0.255
+        ether 00:53:4e:55:4c:30  txqueuelen 1000  (Ethernet)
+        RX packets 3832  bytes 785911 (767.4 KiB)
+        RX errors 0  dropped 0  overruns 0  frame 0
+        TX packets 3867  bytes 791253 (772.7 KiB)
+        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+
+sn1: flags=4291<UP,BROADCAST,RUNNING,NOARP,MULTICAST>  mtu 1500
+        inet 192.168.1.2  netmask 255.255.255.0  broadcast 192.168.1.255
+        ether 00:53:4e:55:4c:31  txqueuelen 1000  (Ethernet)
+        RX packets 3867  bytes 791253 (772.7 KiB)
+        RX errors 0  dropped 0  overruns 0  frame 0
+        TX packets 3832  bytes 785911 (767.4 KiB)
+        TX errors 0  dropped 0 overruns 0  carrier 0  collisions 0
+
+ */
